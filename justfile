@@ -34,7 +34,7 @@ install_dev_tools:
 # Format source code with cargo fmt
 [group('lint')]
 fmt:
-  cargo fmt --all
+  cargo +nightly fmt --all
 
 # Lint source code CI linter
 [group('lint')]
