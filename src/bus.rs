@@ -20,7 +20,8 @@ impl<BUS> Max7456<BUS> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use embedded_hal_mock::eh1::spi::{Mock as SpiMock, Transaction as SpiTransaction};
+    use embedded_hal_mock::eh1::spi::Mock as SpiMock;
+    use embedded_hal_mock::eh1::spi::Transaction as SpiTransaction;
 
     #[test]
     fn test_basic() {

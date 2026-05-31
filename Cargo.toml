@@ -2,6 +2,8 @@
 name = "uf-max7456"
 version = "0.1.0"
 edition = "2024"
+authors = ["Nickolai Novik <nickolainovik@gmail.com>"]
+description = "uf-max7456"
 
 readme = "README.md"
 include = [
