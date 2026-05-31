@@ -183,7 +183,8 @@ mod test {
     extern crate std;
 
     use super::*;
-    use embedded_hal::delay::DelayNs;
+    use embedded_hal::delay::DelayNs as BlockingDelayNs;
+    use embedded_hal_async::delay::DelayNs as AsyncDelayNs;
     use embedded_hal_mock::eh1::spi::Mock as SpiMock;
     use embedded_hal_mock::eh1::spi::Transaction as SpiTransaction;
     use std::vec;
@@ -191,12 +192,18 @@ mod test {
     #[derive(Default)]
     struct NoopDelay;
 
-    impl DelayNs for NoopDelay {
+    impl BlockingDelayNs for NoopDelay {
         fn delay_ns(&mut self, _ns: u32) {}
     }
 
+    #[derive(Default)]
+    struct AsyncNoopDelay;
+    impl AsyncDelayNs for AsyncNoopDelay {
+        async fn delay_ns(&mut self, _ns: u32) {}
+    }
+
     #[test]
-    fn test_basic() {
+    fn test_basic_blocking() {
         let expectations: &[SpiTransaction<u8>] = &[];
         let spi = SpiMock::new(expectations);
 
@@ -204,9 +211,18 @@ mod test {
         let mut spi = driver.release();
         spi.done();
     }
+    #[futures_test::test]
+    async fn test_basic_async() {
+        let expectations: &[SpiTransaction<u8>] = &[];
+        let spi = SpiMock::new(expectations);
+
+        let driver = Max7456Async::new(spi);
+        let mut spi = driver.release();
+        spi.done();
+    }
 
     #[test]
-    fn test_init_at7456e() {
+    fn test_init_at7456e_blocking() {
         let expectations: &[SpiTransaction<u8>] = &[
             SpiTransaction::transaction_start(),
             SpiTransaction::write_vec(vec![registers::END_STRING]),
@@ -239,8 +255,42 @@ mod test {
         spi.done();
     }
 
+    #[futures_test::test]
+    async fn test_init_at7456e_async() {
+        let expectations: &[SpiTransaction<u8>] = &[
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(vec![registers::END_STRING]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(vec![registers::OSDM | registers::READ]),
+            SpiTransaction::read(0x1b),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(vec![registers::CMAL, registers::CMAL_CA8_BIT]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(vec![registers::CMAL | registers::READ]),
+            SpiTransaction::read(registers::CMAL_CA8_BIT),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(vec![registers::VM0, registers::VM0_RESET]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(vec![registers::VM0 | registers::READ]),
+            SpiTransaction::read(0x00),
+            SpiTransaction::transaction_end(),
+        ];
+        let spi = SpiMock::new(expectations);
+        let mut driver = Max7456Async::new(spi);
+        let mut delay = AsyncNoopDelay;
+        let device = driver.init(&mut delay, Config::default()).await.unwrap();
+        assert_eq!(device, DeviceType::At7456e);
+        let mut spi = driver.release();
+        spi.done();
+    }
+
     #[test]
-    fn test_init_not_found() {
+    fn test_init_not_found_blocking() {
         let expectations: &[SpiTransaction<u8>] = &[
             SpiTransaction::transaction_start(),
             SpiTransaction::write_vec(vec![registers::END_STRING]),
@@ -254,6 +304,30 @@ mod test {
         let mut driver = Max7456Blocking::new(spi);
         let mut delay = NoopDelay;
         let err = driver.init(&mut delay, Config::default()).err().unwrap();
+        assert!(matches!(err, Error::NotFound { osdm: 0x00 }));
+        let mut spi = driver.release();
+        spi.done();
+    }
+
+    #[futures_test::test]
+    async fn test_init_not_found_async() {
+        let expectations: &[SpiTransaction<u8>] = &[
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(vec![registers::END_STRING]),
+            SpiTransaction::transaction_end(),
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write_vec(vec![registers::OSDM | registers::READ]),
+            SpiTransaction::read(0x00),
+            SpiTransaction::transaction_end(),
+        ];
+        let spi = SpiMock::new(expectations);
+        let mut driver = Max7456Async::new(spi);
+        let mut delay = AsyncNoopDelay;
+        let err = driver
+            .init(&mut delay, Config::default())
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(err, Error::NotFound { osdm: 0x00 }));
         let mut spi = driver.release();
         spi.done();
