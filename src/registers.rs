@@ -1,6 +1,7 @@
 //! MAX7456/AT7456E register map
 
 pub const READ: u8 = 0x80;
+pub const END_STRING: u8 = 0xff;
 
 pub const VM0: u8 = 0x00;
 pub const VM1: u8 = 0x01;
@@ -35,3 +36,7 @@ pub const RB15: u8 = 0x1f;
 
 pub const OSDBL: u8 = 0x6c;
 pub const STAT: u8 = 0xa0;
+
+pub const VM0_RESET: u8 = 0x02;
+pub const OSDM_DEFAULT: u8 = 0x1b;
+pub const CMAL_CA8_BIT: u8 = 1 << 6;
