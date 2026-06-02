@@ -38,5 +38,25 @@ pub const OSDBL: u8 = 0x6c;
 pub const STAT: u8 = 0xa0;
 
 pub const VM0_RESET: u8 = 0x02;
+pub const VM0_OSD_ENABLE: u8 = 0x08;
+pub const VM0_SYNC_MODE_EXTERNAL: u8 = 0x20;
+pub const VM0_SYNC_MODE_INTERNAL: u8 = 0x30;
+pub const VM0_VIDEO_MODE_PAL: u8 = 0x40;
+pub const VM0_VIDEO_MODE_NTSC: u8 = 0x00;
+
+pub const VM1_BLINK_DUTY_75_25: u8 = 0x03;
+pub const VM1_BLINK_TIME_1: u8 = 0x04;
+pub const VM1_BACKGROUND_MODE_GRAY: u8 = 0x80;
+
+pub const DMM_AUTO_INCREMENT: u8 = 0x01;
+pub const DMM_CLEAR_DISPLAY: u8 = 0x04;
+pub const DMM_CLEAR_DISPLAY_VERT: u8 = 0x06;
+pub const DMM_INVERT_PIXEL_COLOR: u8 = 0x08;
+
 pub const OSDM_DEFAULT: u8 = 0x1b;
 pub const CMAL_CA8_BIT: u8 = 1 << 6;
+
+pub const STAT_PAL: u8 = 0x01;
+pub const STAT_NTSC: u8 = 0x02;
+pub const STAT_LOS: u8 = 0x04;
+pub const STAT_NVR_BUSY: u8 = 0x20;

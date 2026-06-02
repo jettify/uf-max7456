@@ -17,7 +17,7 @@ include = [
   "/examples/**/*.rs",
 ]
 
-keywords = ["embedded-hal-driver"]
+keywords = ["embedded-hal-driver", "MAX7456", "AT7456E"]
 categories = [
   "embedded",
   "no-std",
