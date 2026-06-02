@@ -34,18 +34,19 @@ uf-max7456 = { version = "0.1", features = ["defmt"] }
 ## Usage
 
 ```rust
-use uf_max7456::{Config, Max7456Async};
+use uf_max7456::{Config, Configured, Max7456Async};
 
 async fn init_osd<SPI, DELAY>(
     spi: SPI,
     delay: &mut DELAY,
-) -> Result<Max7456Async<SPI>, uf_max7456::Error<SPI::Error>>
+) -> Result<Max7456Async<SPI, Configured>, uf_max7456::Error<SPI::Error>>
 where
     SPI: embedded_hal_async::spi::SpiDevice,
     DELAY: embedded_hal_async::delay::DelayNs,
 {
-    let mut osd = Max7456Async::new(spi);
-    let state = osd.init(delay, Config::auto()).await?;
+    let osd = Max7456Async::new(spi);
+    let mut osd = osd.init(delay, Config::auto()).await.map_err(|e| e.error)?;
+    let state = osd.state();
 
     osd.write_text(0, 0, b"uf-max7456").await?;
     osd.write_char(state.geometry.columns - 1, 0, b'!').await?;

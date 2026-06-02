@@ -46,7 +46,6 @@ pub enum Error<SpiError> {
     NotFound { osdm: u8 },
     ResetTimeout,
     NvrBusyTimeout,
-    Uninitialized,
     OutOfBounds { position: u16, len: u16 },
     InvalidCoordinate { x: u8, y: u8, columns: u8, rows: u8 },
     Config(ConfigError),

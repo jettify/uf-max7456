@@ -10,12 +10,15 @@ pub mod config;
 pub mod error;
 pub mod registers;
 
+pub use bus::Configured;
 pub use bus::DeviceType;
 pub use bus::DisplayPosition;
+pub use bus::InitError;
 pub use bus::Max7456Async;
 pub use bus::Max7456Blocking;
 pub use bus::RuntimeState;
 pub use bus::Status;
+pub use bus::Uninitialized;
 pub use config::BackgroundMode;
 pub use config::Config;
 pub use config::ScreenGeometry;

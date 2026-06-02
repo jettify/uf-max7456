@@ -79,35 +79,52 @@ impl Status {
     }
 }
 
-pub struct Max7456Async<SPI> {
-    pub(crate) bus: SPI,
-    state: Option<RuntimeState>,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Uninitialized;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Configured {
+    runtime: RuntimeState,
 }
 
-impl<SPI> Max7456Async<SPI> {
-    pub fn new(bus: SPI) -> Self {
-        Self { bus, state: None }
+#[derive(Debug)]
+pub struct InitError<Driver, SpiError> {
+    pub driver: Driver,
+    pub error: Error<SpiError>,
+}
+
+impl<Driver, SpiError> InitError<Driver, SpiError> {
+    pub fn into_parts(self) -> (Driver, Error<SpiError>) {
+        (self.driver, self.error)
     }
 
+    pub fn error(&self) -> &Error<SpiError> {
+        &self.error
+    }
+
+    pub fn driver(&self) -> &Driver {
+        &self.driver
+    }
+}
+
+#[derive(Debug)]
+pub struct Max7456Async<SPI, State = Uninitialized> {
+    pub(crate) bus: SPI,
+    state: State,
+}
+
+impl<SPI> Max7456Async<SPI, Uninitialized> {
+    pub fn new(bus: SPI) -> Self {
+        Self {
+            bus,
+            state: Uninitialized,
+        }
+    }
+}
+
+impl<SPI, State> Max7456Async<SPI, State> {
     pub fn bus(&mut self) -> &mut SPI {
         &mut self.bus
-    }
-
-    pub fn state(&self) -> Option<RuntimeState> {
-        self.state
-    }
-
-    pub fn geometry(&self) -> Option<ScreenGeometry> {
-        self.state.map(|state| state.geometry)
-    }
-
-    pub fn position(
-        &self,
-        x: u8,
-        y: u8,
-    ) -> Result<DisplayPosition, Error<core::convert::Infallible>> {
-        let state = self.state.ok_or(Error::Uninitialized)?;
-        display_position(state.geometry, x, y)
     }
 
     pub fn release(self) -> SPI {
@@ -115,26 +132,13 @@ impl<SPI> Max7456Async<SPI> {
     }
 }
 
-pub struct Max7456Blocking<SPI> {
-    pub(crate) bus: SPI,
-    state: Option<RuntimeState>,
-}
-
-impl<SPI> Max7456Blocking<SPI> {
-    pub fn new(bus: SPI) -> Self {
-        Self { bus, state: None }
+impl<SPI> Max7456Async<SPI, Configured> {
+    pub fn state(&self) -> RuntimeState {
+        self.state.runtime
     }
 
-    pub fn bus(&mut self) -> &mut SPI {
-        &mut self.bus
-    }
-
-    pub fn state(&self) -> Option<RuntimeState> {
-        self.state
-    }
-
-    pub fn geometry(&self) -> Option<ScreenGeometry> {
-        self.state.map(|state| state.geometry)
+    pub fn geometry(&self) -> ScreenGeometry {
+        self.state.runtime.geometry
     }
 
     pub fn position(
@@ -142,8 +146,28 @@ impl<SPI> Max7456Blocking<SPI> {
         x: u8,
         y: u8,
     ) -> Result<DisplayPosition, Error<core::convert::Infallible>> {
-        let state = self.state.ok_or(Error::Uninitialized)?;
-        display_position(state.geometry, x, y)
+        display_position(self.geometry(), x, y)
+    }
+}
+
+#[derive(Debug)]
+pub struct Max7456Blocking<SPI, State = Uninitialized> {
+    pub(crate) bus: SPI,
+    state: State,
+}
+
+impl<SPI> Max7456Blocking<SPI, Uninitialized> {
+    pub fn new(bus: SPI) -> Self {
+        Self {
+            bus,
+            state: Uninitialized,
+        }
+    }
+}
+
+impl<SPI, State> Max7456Blocking<SPI, State> {
+    pub fn bus(&mut self) -> &mut SPI {
+        &mut self.bus
     }
 
     pub fn release(self) -> SPI {
@@ -151,41 +175,28 @@ impl<SPI> Max7456Blocking<SPI> {
     }
 }
 
-impl<SPI> Max7456Async<SPI>
+impl<SPI> Max7456Blocking<SPI, Configured> {
+    pub fn state(&self) -> RuntimeState {
+        self.state.runtime
+    }
+
+    pub fn geometry(&self) -> ScreenGeometry {
+        self.state.runtime.geometry
+    }
+
+    pub fn position(
+        &self,
+        x: u8,
+        y: u8,
+    ) -> Result<DisplayPosition, Error<core::convert::Infallible>> {
+        display_position(self.geometry(), x, y)
+    }
+}
+
+impl<SPI, State> Max7456Async<SPI, State>
 where
     SPI: AsyncSpiDevice,
 {
-    pub async fn init<DelayNs>(
-        &mut self,
-        delay: &mut DelayNs,
-        config: Config,
-    ) -> Result<RuntimeState, Error<SPI::Error>>
-    where
-        DelayNs: AsyncDelayNs,
-    {
-        self.write_end_string().await?;
-
-        let osdm = self.raw_read_register(registers::OSDM).await?;
-        if osdm != registers::OSDM_DEFAULT {
-            return Err(Error::NotFound { osdm });
-        }
-
-        let device_type = self.detect_device_type().await?;
-
-        self.raw_write_register(registers::VM0, registers::VM0_RESET)
-            .await?;
-        delay.delay_us(config.reset_settle_delay_us).await;
-        for _ in 0..config.reset_poll_max_tries {
-            let vm0 = self.raw_read_register(registers::VM0).await?;
-            if (vm0 & registers::VM0_RESET) == 0 {
-                let state = self.apply_config(device_type, config).await?;
-                self.state = Some(state);
-                return Ok(state);
-            }
-        }
-        Err(Error::ResetTimeout)
-    }
-
     pub async fn raw_write_register(&mut self, register: u8, value: u8) -> Result<(), SPI::Error> {
         let tx = [register, value];
         let mut ops = [AsyncOperation::Write(&tx)];
@@ -207,92 +218,6 @@ where
         self.raw_read_register(registers::STAT)
             .await
             .map(Status::from_raw)
-    }
-
-    pub async fn set_invert(&mut self, invert: bool) -> Result<(), Error<SPI::Error>> {
-        let mut state = self.initialized_state()?;
-        if invert {
-            state.dmm |= registers::DMM_INVERT_PIXEL_COLOR;
-        } else {
-            state.dmm &= !registers::DMM_INVERT_PIXEL_COLOR;
-        }
-        self.raw_write_register(registers::DMM, state.dmm).await?;
-        self.state = Some(state);
-        Ok(())
-    }
-
-    pub async fn clear_display(&mut self) -> Result<(), Error<SPI::Error>> {
-        let dmm = self.initialized_state()?.dmm;
-        self.raw_write_register(registers::DMM, dmm | registers::DMM_CLEAR_DISPLAY)
-            .await?;
-        self.restore_dmm().await
-    }
-
-    pub async fn write_display_byte(
-        &mut self,
-        position: DisplayPosition,
-        value: u8,
-    ) -> Result<(), Error<SPI::Error>> {
-        self.set_display_address(position.index()).await?;
-        self.raw_write_register(registers::DMDI, sanitize_display_byte(value))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn write_display_run_at(
-        &mut self,
-        position: DisplayPosition,
-        values: &[u8],
-    ) -> Result<(), Error<SPI::Error>> {
-        let len = display_slice_len(values)?;
-        self.check_display_range(position.index(), len)?;
-        if values.is_empty() {
-            return Ok(());
-        }
-        if let [value] = values {
-            return self.write_display_byte(position, *value).await;
-        }
-
-        self.write_dmm_mode(self.initialized_state()?.dmm | registers::DMM_AUTO_INCREMENT)
-            .await?;
-        self.set_display_address(position.index()).await?;
-        for value in values {
-            self.raw_write_register(registers::DMDI, sanitize_display_byte(*value))
-                .await?;
-        }
-        self.write_end_string().await?;
-        self.restore_dmm().await
-    }
-
-    pub async fn write_char(&mut self, x: u8, y: u8, value: u8) -> Result<(), Error<SPI::Error>> {
-        let position = self.display_position(x, y)?;
-        self.write_display_byte(position, value).await
-    }
-
-    pub async fn write_text(
-        &mut self,
-        x: u8,
-        y: u8,
-        values: &[u8],
-    ) -> Result<(), Error<SPI::Error>> {
-        let state = self.initialized_state()?;
-        let position = display_position(state.geometry, x, y)?;
-        let len = display_slice_len(values)?;
-        let row_end = (y as u16 + 1) * state.geometry.columns as u16;
-        if position.index() + len > row_end {
-            return Err(Error::OutOfBounds {
-                position: position.index(),
-                len: row_end,
-            });
-        }
-        self.write_display_run_at(position, values).await
-    }
-
-    pub async fn clear_row(&mut self, y: u8) -> Result<(), Error<SPI::Error>> {
-        let state = self.initialized_state()?;
-        let position = display_position(state.geometry, 0, y)?;
-        let spaces = [b' '; 30];
-        self.write_display_run_at(position, &spaces).await
     }
 
     async fn write_end_string(&mut self) -> Result<(), SPI::Error> {
@@ -323,6 +248,94 @@ where
             }
         }
         Err(Error::NvrBusyTimeout)
+    }
+}
+
+impl<SPI> Max7456Async<SPI, Uninitialized>
+where
+    SPI: AsyncSpiDevice,
+{
+    pub async fn init<DelayNs>(
+        mut self,
+        delay: &mut DelayNs,
+        config: Config,
+    ) -> Result<Max7456Async<SPI, Configured>, InitError<Self, SPI::Error>>
+    where
+        DelayNs: AsyncDelayNs,
+    {
+        if let Err(e) = self.write_end_string().await {
+            return Err(InitError {
+                driver: self,
+                error: Error::Spi(e),
+            });
+        }
+
+        let osdm = match self.raw_read_register(registers::OSDM).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(InitError {
+                    driver: self,
+                    error: Error::Spi(e),
+                });
+            }
+        };
+        if osdm != registers::OSDM_DEFAULT {
+            return Err(InitError {
+                driver: self,
+                error: Error::NotFound { osdm },
+            });
+        }
+
+        let device_type = match self.detect_device_type().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(InitError {
+                    driver: self,
+                    error: e,
+                });
+            }
+        };
+
+        if let Err(e) = self
+            .raw_write_register(registers::VM0, registers::VM0_RESET)
+            .await
+        {
+            return Err(InitError {
+                driver: self,
+                error: Error::Spi(e),
+            });
+        }
+        delay.delay_us(config.reset_settle_delay_us).await;
+        for _ in 0..config.reset_poll_max_tries {
+            let vm0 = match self.raw_read_register(registers::VM0).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(InitError {
+                        driver: self,
+                        error: Error::Spi(e),
+                    });
+                }
+            };
+            if (vm0 & registers::VM0_RESET) == 0 {
+                let state = match self.apply_config(device_type, config).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(InitError {
+                            driver: self,
+                            error: e,
+                        });
+                    }
+                };
+                return Ok(Max7456Async {
+                    bus: self.bus,
+                    state: Configured { runtime: state },
+                });
+            }
+        }
+        Err(InitError {
+            driver: self,
+            error: Error::ResetTimeout,
+        })
     }
 
     async fn apply_config(
@@ -363,6 +376,97 @@ where
             dmm,
         })
     }
+}
+
+impl<SPI> Max7456Async<SPI, Configured>
+where
+    SPI: AsyncSpiDevice,
+{
+    pub async fn set_invert(&mut self, invert: bool) -> Result<(), Error<SPI::Error>> {
+        let mut state = self.state.runtime;
+        if invert {
+            state.dmm |= registers::DMM_INVERT_PIXEL_COLOR;
+        } else {
+            state.dmm &= !registers::DMM_INVERT_PIXEL_COLOR;
+        }
+        self.raw_write_register(registers::DMM, state.dmm).await?;
+        self.state.runtime = state;
+        Ok(())
+    }
+
+    pub async fn clear_display(&mut self) -> Result<(), Error<SPI::Error>> {
+        let dmm = self.state.runtime.dmm;
+        self.raw_write_register(registers::DMM, dmm | registers::DMM_CLEAR_DISPLAY)
+            .await?;
+        self.restore_dmm().await
+    }
+
+    pub async fn write_display_byte(
+        &mut self,
+        position: DisplayPosition,
+        value: u8,
+    ) -> Result<(), Error<SPI::Error>> {
+        self.set_display_address(position.index()).await?;
+        self.raw_write_register(registers::DMDI, sanitize_display_byte(value))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn write_display_run_at(
+        &mut self,
+        position: DisplayPosition,
+        values: &[u8],
+    ) -> Result<(), Error<SPI::Error>> {
+        let len = display_slice_len(values)?;
+        self.check_display_range(position.index(), len)?;
+        if values.is_empty() {
+            return Ok(());
+        }
+        if let [value] = values {
+            return self.write_display_byte(position, *value).await;
+        }
+
+        self.write_dmm_mode(self.state.runtime.dmm | registers::DMM_AUTO_INCREMENT)
+            .await?;
+        self.set_display_address(position.index()).await?;
+        for value in values {
+            self.raw_write_register(registers::DMDI, sanitize_display_byte(*value))
+                .await?;
+        }
+        self.write_end_string().await?;
+        self.restore_dmm().await
+    }
+
+    pub async fn write_char(&mut self, x: u8, y: u8, value: u8) -> Result<(), Error<SPI::Error>> {
+        let position = self.display_position(x, y)?;
+        self.write_display_byte(position, value).await
+    }
+
+    pub async fn write_text(
+        &mut self,
+        x: u8,
+        y: u8,
+        values: &[u8],
+    ) -> Result<(), Error<SPI::Error>> {
+        let state = self.state.runtime;
+        let position = display_position(state.geometry, x, y)?;
+        let len = display_slice_len(values)?;
+        let row_end = (y as u16 + 1) * state.geometry.columns as u16;
+        if position.index() + len > row_end {
+            return Err(Error::OutOfBounds {
+                position: position.index(),
+                len: row_end,
+            });
+        }
+        self.write_display_run_at(position, values).await
+    }
+
+    pub async fn clear_row(&mut self, y: u8) -> Result<(), Error<SPI::Error>> {
+        let state = self.state.runtime;
+        let position = display_position(state.geometry, 0, y)?;
+        let spaces = [b' '; 30];
+        self.write_display_run_at(position, &spaces).await
+    }
 
     async fn set_display_address(&mut self, position: u16) -> Result<(), SPI::Error> {
         self.raw_write_register(registers::DMAH, (position >> 8) as u8)
@@ -376,22 +480,17 @@ where
     }
 
     async fn restore_dmm(&mut self) -> Result<(), Error<SPI::Error>> {
-        let dmm = self.initialized_state()?.dmm;
+        let dmm = self.state.runtime.dmm;
         self.write_dmm_mode(dmm).await?;
         Ok(())
     }
 
-    fn initialized_state(&self) -> Result<RuntimeState, Error<SPI::Error>> {
-        self.state.ok_or(Error::Uninitialized)
-    }
-
     fn display_position(&self, x: u8, y: u8) -> Result<DisplayPosition, Error<SPI::Error>> {
-        let state = self.initialized_state()?;
-        display_position(state.geometry, x, y)
+        display_position(self.state.runtime.geometry, x, y)
     }
 
     fn check_display_range(&self, position: u16, len: u16) -> Result<(), Error<SPI::Error>> {
-        let geometry = self.initialized_state()?.geometry;
+        let geometry = self.state.runtime.geometry;
         let Some(end) = position.checked_add(len) else {
             return Err(Error::OutOfBounds {
                 position,
@@ -408,40 +507,10 @@ where
     }
 }
 
-impl<SPI> Max7456Blocking<SPI>
+impl<SPI, State> Max7456Blocking<SPI, State>
 where
     SPI: BlockingSpiDevice,
 {
-    pub fn init<DelayNs>(
-        &mut self,
-        delay: &mut DelayNs,
-        config: Config,
-    ) -> Result<RuntimeState, Error<SPI::Error>>
-    where
-        DelayNs: BlockingDelayNs,
-    {
-        self.write_end_string()?;
-
-        let osdm = self.raw_read_register(registers::OSDM)?;
-        if osdm != registers::OSDM_DEFAULT {
-            return Err(Error::NotFound { osdm });
-        }
-
-        let device_type = self.detect_device_type()?;
-
-        self.raw_write_register(registers::VM0, registers::VM0_RESET)?;
-        delay.delay_us(config.reset_settle_delay_us);
-        for _ in 0..config.reset_poll_max_tries {
-            let vm0 = self.raw_read_register(registers::VM0)?;
-            if (vm0 & registers::VM0_RESET) == 0 {
-                let state = self.apply_config(device_type, config)?;
-                self.state = Some(state);
-                return Ok(state);
-            }
-        }
-        Err(Error::ResetTimeout)
-    }
-
     pub fn raw_write_register(&mut self, register: u8, value: u8) -> Result<(), SPI::Error> {
         let tx = [register, value];
         let mut ops = [BlockingOperation::Write(&tx)];
@@ -462,83 +531,6 @@ where
     pub fn read_status(&mut self) -> Result<Status, SPI::Error> {
         self.raw_read_register(registers::STAT)
             .map(Status::from_raw)
-    }
-
-    pub fn set_invert(&mut self, invert: bool) -> Result<(), Error<SPI::Error>> {
-        let mut state = self.initialized_state()?;
-        if invert {
-            state.dmm |= registers::DMM_INVERT_PIXEL_COLOR;
-        } else {
-            state.dmm &= !registers::DMM_INVERT_PIXEL_COLOR;
-        }
-        self.raw_write_register(registers::DMM, state.dmm)?;
-        self.state = Some(state);
-        Ok(())
-    }
-
-    pub fn clear_display(&mut self) -> Result<(), Error<SPI::Error>> {
-        let dmm = self.initialized_state()?.dmm;
-        self.raw_write_register(registers::DMM, dmm | registers::DMM_CLEAR_DISPLAY)?;
-        self.restore_dmm()
-    }
-
-    pub fn write_display_byte(
-        &mut self,
-        position: DisplayPosition,
-        value: u8,
-    ) -> Result<(), Error<SPI::Error>> {
-        self.set_display_address(position.index())?;
-        self.raw_write_register(registers::DMDI, sanitize_display_byte(value))?;
-        Ok(())
-    }
-
-    pub fn write_display_run_at(
-        &mut self,
-        position: DisplayPosition,
-        values: &[u8],
-    ) -> Result<(), Error<SPI::Error>> {
-        let len = display_slice_len(values)?;
-        self.check_display_range(position.index(), len)?;
-        if values.is_empty() {
-            return Ok(());
-        }
-        if let [value] = values {
-            return self.write_display_byte(position, *value);
-        }
-
-        self.write_dmm_mode(self.initialized_state()?.dmm | registers::DMM_AUTO_INCREMENT)?;
-        self.set_display_address(position.index())?;
-        for value in values {
-            self.raw_write_register(registers::DMDI, sanitize_display_byte(*value))?;
-        }
-        self.write_end_string()?;
-        self.restore_dmm()
-    }
-
-    pub fn write_char(&mut self, x: u8, y: u8, value: u8) -> Result<(), Error<SPI::Error>> {
-        let position = self.display_position(x, y)?;
-        self.write_display_byte(position, value)
-    }
-
-    pub fn write_text(&mut self, x: u8, y: u8, values: &[u8]) -> Result<(), Error<SPI::Error>> {
-        let state = self.initialized_state()?;
-        let position = display_position(state.geometry, x, y)?;
-        let len = display_slice_len(values)?;
-        let row_end = (y as u16 + 1) * state.geometry.columns as u16;
-        if position.index() + len > row_end {
-            return Err(Error::OutOfBounds {
-                position: position.index(),
-                len: row_end,
-            });
-        }
-        self.write_display_run_at(position, values)
-    }
-
-    pub fn clear_row(&mut self, y: u8) -> Result<(), Error<SPI::Error>> {
-        let state = self.initialized_state()?;
-        let position = display_position(state.geometry, 0, y)?;
-        let spaces = [b' '; 30];
-        self.write_display_run_at(position, &spaces)
     }
 
     fn write_end_string(&mut self) -> Result<(), SPI::Error> {
@@ -568,6 +560,91 @@ where
             }
         }
         Err(Error::NvrBusyTimeout)
+    }
+}
+
+impl<SPI> Max7456Blocking<SPI, Uninitialized>
+where
+    SPI: BlockingSpiDevice,
+{
+    pub fn init<DelayNs>(
+        mut self,
+        delay: &mut DelayNs,
+        config: Config,
+    ) -> Result<Max7456Blocking<SPI, Configured>, InitError<Self, SPI::Error>>
+    where
+        DelayNs: BlockingDelayNs,
+    {
+        if let Err(e) = self.write_end_string() {
+            return Err(InitError {
+                driver: self,
+                error: Error::Spi(e),
+            });
+        }
+
+        let osdm = match self.raw_read_register(registers::OSDM) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(InitError {
+                    driver: self,
+                    error: Error::Spi(e),
+                });
+            }
+        };
+        if osdm != registers::OSDM_DEFAULT {
+            return Err(InitError {
+                driver: self,
+                error: Error::NotFound { osdm },
+            });
+        }
+
+        let device_type = match self.detect_device_type() {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(InitError {
+                    driver: self,
+                    error: e,
+                });
+            }
+        };
+
+        if let Err(e) = self.raw_write_register(registers::VM0, registers::VM0_RESET) {
+            return Err(InitError {
+                driver: self,
+                error: Error::Spi(e),
+            });
+        }
+        delay.delay_us(config.reset_settle_delay_us);
+        for _ in 0..config.reset_poll_max_tries {
+            let vm0 = match self.raw_read_register(registers::VM0) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(InitError {
+                        driver: self,
+                        error: Error::Spi(e),
+                    });
+                }
+            };
+            if (vm0 & registers::VM0_RESET) == 0 {
+                let state = match self.apply_config(device_type, config) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(InitError {
+                            driver: self,
+                            error: e,
+                        });
+                    }
+                };
+                return Ok(Max7456Blocking {
+                    bus: self.bus,
+                    state: Configured { runtime: state },
+                });
+            }
+        }
+        Err(InitError {
+            driver: self,
+            error: Error::ResetTimeout,
+        })
     }
 
     fn apply_config(
@@ -606,6 +683,88 @@ where
             dmm,
         })
     }
+}
+
+impl<SPI> Max7456Blocking<SPI, Configured>
+where
+    SPI: BlockingSpiDevice,
+{
+    pub fn set_invert(&mut self, invert: bool) -> Result<(), Error<SPI::Error>> {
+        let mut state = self.state.runtime;
+        if invert {
+            state.dmm |= registers::DMM_INVERT_PIXEL_COLOR;
+        } else {
+            state.dmm &= !registers::DMM_INVERT_PIXEL_COLOR;
+        }
+        self.raw_write_register(registers::DMM, state.dmm)?;
+        self.state.runtime = state;
+        Ok(())
+    }
+
+    pub fn clear_display(&mut self) -> Result<(), Error<SPI::Error>> {
+        let dmm = self.state.runtime.dmm;
+        self.raw_write_register(registers::DMM, dmm | registers::DMM_CLEAR_DISPLAY)?;
+        self.restore_dmm()
+    }
+
+    pub fn write_display_byte(
+        &mut self,
+        position: DisplayPosition,
+        value: u8,
+    ) -> Result<(), Error<SPI::Error>> {
+        self.set_display_address(position.index())?;
+        self.raw_write_register(registers::DMDI, sanitize_display_byte(value))?;
+        Ok(())
+    }
+
+    pub fn write_display_run_at(
+        &mut self,
+        position: DisplayPosition,
+        values: &[u8],
+    ) -> Result<(), Error<SPI::Error>> {
+        let len = display_slice_len(values)?;
+        self.check_display_range(position.index(), len)?;
+        if values.is_empty() {
+            return Ok(());
+        }
+        if let [value] = values {
+            return self.write_display_byte(position, *value);
+        }
+
+        self.write_dmm_mode(self.state.runtime.dmm | registers::DMM_AUTO_INCREMENT)?;
+        self.set_display_address(position.index())?;
+        for value in values {
+            self.raw_write_register(registers::DMDI, sanitize_display_byte(*value))?;
+        }
+        self.write_end_string()?;
+        self.restore_dmm()
+    }
+
+    pub fn write_char(&mut self, x: u8, y: u8, value: u8) -> Result<(), Error<SPI::Error>> {
+        let position = self.display_position(x, y)?;
+        self.write_display_byte(position, value)
+    }
+
+    pub fn write_text(&mut self, x: u8, y: u8, values: &[u8]) -> Result<(), Error<SPI::Error>> {
+        let state = self.state.runtime;
+        let position = display_position(state.geometry, x, y)?;
+        let len = display_slice_len(values)?;
+        let row_end = (y as u16 + 1) * state.geometry.columns as u16;
+        if position.index() + len > row_end {
+            return Err(Error::OutOfBounds {
+                position: position.index(),
+                len: row_end,
+            });
+        }
+        self.write_display_run_at(position, values)
+    }
+
+    pub fn clear_row(&mut self, y: u8) -> Result<(), Error<SPI::Error>> {
+        let state = self.state.runtime;
+        let position = display_position(state.geometry, 0, y)?;
+        let spaces = [b' '; 30];
+        self.write_display_run_at(position, &spaces)
+    }
 
     fn set_display_address(&mut self, position: u16) -> Result<(), SPI::Error> {
         self.raw_write_register(registers::DMAH, (position >> 8) as u8)?;
@@ -617,22 +776,17 @@ where
     }
 
     fn restore_dmm(&mut self) -> Result<(), Error<SPI::Error>> {
-        let dmm = self.initialized_state()?.dmm;
+        let dmm = self.state.runtime.dmm;
         self.write_dmm_mode(dmm)?;
         Ok(())
     }
 
-    fn initialized_state(&self) -> Result<RuntimeState, Error<SPI::Error>> {
-        self.state.ok_or(Error::Uninitialized)
-    }
-
     fn display_position(&self, x: u8, y: u8) -> Result<DisplayPosition, Error<SPI::Error>> {
-        let state = self.initialized_state()?;
-        display_position(state.geometry, x, y)
+        display_position(self.state.runtime.geometry, x, y)
     }
 
     fn check_display_range(&self, position: u16, len: u16) -> Result<(), Error<SPI::Error>> {
-        let geometry = self.initialized_state()?.geometry;
+        let geometry = self.state.runtime.geometry;
         let Some(end) = position.checked_add(len) else {
             return Err(Error::OutOfBounds {
                 position,
@@ -790,8 +944,8 @@ fn detect_video_mode_from_stat(stat: u8) -> VideoMode {
     }
 }
 
-fn resolve_video_mode_blocking<SPI>(
-    max7456: &mut Max7456Blocking<SPI>,
+fn resolve_video_mode_blocking<SPI, State>(
+    max7456: &mut Max7456Blocking<SPI, State>,
     requested: VideoMode,
 ) -> Result<VideoMode, Error<SPI::Error>>
 where
@@ -806,8 +960,8 @@ where
     }
 }
 
-async fn resolve_video_mode_async<SPI>(
-    max7456: &mut Max7456Async<SPI>,
+async fn resolve_video_mode_async<SPI, State>(
+    max7456: &mut Max7456Async<SPI, State>,
     requested: VideoMode,
 ) -> Result<VideoMode, Error<SPI::Error>>
 where
@@ -870,9 +1024,10 @@ mod test {
     fn test_init_at7456e_blocking() {
         let expectations = init_success_expectations(registers::CMAL_CA8_BIT);
         let spi = SpiMock::new(&expectations);
-        let mut driver = Max7456Blocking::new(spi);
+        let driver = Max7456Blocking::new(spi);
         let mut delay = NoopDelay;
-        let state = driver.init(&mut delay, test_config()).unwrap();
+        let driver = driver.init(&mut delay, test_config()).unwrap();
+        let state = driver.state();
         assert_eq!(state.device_type, DeviceType::At7456e);
         assert_eq!(state.video_mode, VideoMode::Pal);
         assert_eq!(
@@ -891,9 +1046,10 @@ mod test {
     async fn test_init_at7456e_async() {
         let expectations = init_success_expectations(registers::CMAL_CA8_BIT);
         let spi = SpiMock::new(&expectations);
-        let mut driver = Max7456Async::new(spi);
+        let driver = Max7456Async::new(spi);
         let mut delay = AsyncNoopDelay;
-        let state = driver.init(&mut delay, test_config()).await.unwrap();
+        let driver = driver.init(&mut delay, test_config()).await.unwrap();
+        let state = driver.state();
         assert_eq!(state.device_type, DeviceType::At7456e);
         assert_eq!(state.geometry.len, 480);
         let mut spi = driver.release();
@@ -904,9 +1060,10 @@ mod test {
     fn test_init_max7456_blocking() {
         let expectations = init_success_expectations(0);
         let spi = SpiMock::new(&expectations);
-        let mut driver = Max7456Blocking::new(spi);
+        let driver = Max7456Blocking::new(spi);
         let mut delay = NoopDelay;
-        let state = driver.init(&mut delay, test_config()).unwrap();
+        let driver = driver.init(&mut delay, test_config()).unwrap();
+        let state = driver.state();
         assert_eq!(state.device_type, DeviceType::Max7456);
         let mut spi = driver.release();
         spi.done();
@@ -921,9 +1078,10 @@ mod test {
         let expectations =
             init_success_expectations_with_config(registers::CMAL_CA8_BIT, config, Some(0));
         let spi = SpiMock::new(&expectations);
-        let mut driver = Max7456Blocking::new(spi);
+        let driver = Max7456Blocking::new(spi);
         let mut delay = NoopDelay;
-        let state = driver.init(&mut delay, config).unwrap();
+        let driver = driver.init(&mut delay, config).unwrap();
+        let state = driver.state();
         assert_eq!(state.video_mode, VideoMode::Ntsc);
         assert_eq!(state.geometry.rows, 13);
         assert_eq!(state.geometry.len, 390);
@@ -943,11 +1101,11 @@ mod test {
             SpiTransaction::transaction_end(),
         ];
         let spi = SpiMock::new(expectations);
-        let mut driver = Max7456Blocking::new(spi);
+        let driver = Max7456Blocking::new(spi);
         let mut delay = NoopDelay;
-        let err = driver.init(&mut delay, test_config()).err().unwrap();
-        assert!(matches!(err, Error::NotFound { osdm: 0x00 }));
-        let mut spi = driver.release();
+        let init_err = driver.init(&mut delay, test_config()).err().unwrap();
+        assert!(matches!(init_err.error, Error::NotFound { osdm: 0x00 }));
+        let mut spi = init_err.driver.release();
         spi.done();
     }
 
@@ -963,11 +1121,11 @@ mod test {
             SpiTransaction::transaction_end(),
         ];
         let spi = SpiMock::new(expectations);
-        let mut driver = Max7456Async::new(spi);
+        let driver = Max7456Async::new(spi);
         let mut delay = AsyncNoopDelay;
-        let err = driver.init(&mut delay, test_config()).await.err().unwrap();
-        assert!(matches!(err, Error::NotFound { osdm: 0x00 }));
-        let mut spi = driver.release();
+        let init_err = driver.init(&mut delay, test_config()).await.err().unwrap();
+        assert!(matches!(init_err.error, Error::NotFound { osdm: 0x00 }));
+        let mut spi = init_err.driver.release();
         spi.done();
     }
 
@@ -990,11 +1148,11 @@ mod test {
         }
 
         let spi = SpiMock::new(&expectations);
-        let mut driver = Max7456Blocking::new(spi);
+        let driver = Max7456Blocking::new(spi);
         let mut delay = NoopDelay;
-        let err = driver.init(&mut delay, test_config()).err().unwrap();
-        assert!(matches!(err, Error::NvrBusyTimeout));
-        let mut spi = driver.release();
+        let init_err = driver.init(&mut delay, test_config()).err().unwrap();
+        assert!(matches!(init_err.error, Error::NvrBusyTimeout));
+        let mut spi = init_err.driver.release();
         spi.done();
     }
 
@@ -1006,9 +1164,9 @@ mod test {
         push_write(&mut expectations, registers::DMDI, b' ');
 
         let spi = SpiMock::new(&expectations);
-        let mut driver = Max7456Blocking::new(spi);
+        let driver = Max7456Blocking::new(spi);
         let mut delay = NoopDelay;
-        driver.init(&mut delay, test_config()).unwrap();
+        let mut driver = driver.init(&mut delay, test_config()).unwrap();
         driver.write_char(29, 15, registers::END_STRING).unwrap();
         let mut spi = driver.release();
         spi.done();
@@ -1042,34 +1200,24 @@ mod test {
         );
 
         let spi = SpiMock::new(&expectations);
-        let mut driver = Max7456Blocking::new(spi);
+        let driver = Max7456Blocking::new(spi);
         let mut delay = NoopDelay;
-        driver.init(&mut delay, config).unwrap();
+        let mut driver = driver.init(&mut delay, config).unwrap();
         driver
             .write_text(0, 0, &[b'A', registers::END_STRING, b'C'])
             .unwrap();
-        assert_eq!(
-            driver.state().unwrap().dmm,
-            registers::DMM_INVERT_PIXEL_COLOR
-        );
+        assert_eq!(driver.state().dmm, registers::DMM_INVERT_PIXEL_COLOR);
         let mut spi = driver.release();
         spi.done();
     }
 
     #[test]
-    fn test_display_write_requires_init_and_bounds() {
-        let spi = SpiMock::new(&[]);
-        let mut driver = Max7456Blocking::new(spi);
-        let err = driver.write_char(0, 0, b'A').err().unwrap();
-        assert!(matches!(err, Error::Uninitialized));
-        let mut spi = driver.release();
-        spi.done();
-
+    fn test_display_write_bounds_after_init() {
         let expectations = init_success_expectations(registers::CMAL_CA8_BIT);
         let spi = SpiMock::new(&expectations);
-        let mut driver = Max7456Blocking::new(spi);
+        let driver = Max7456Blocking::new(spi);
         let mut delay = NoopDelay;
-        driver.init(&mut delay, test_config()).unwrap();
+        let mut driver = driver.init(&mut delay, test_config()).unwrap();
         let err = driver.write_char(30, 0, b'A').err().unwrap();
         assert!(matches!(
             err,
