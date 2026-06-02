@@ -197,6 +197,17 @@ impl<SPI, State> Max7456Async<SPI, State>
 where
     SPI: AsyncSpiDevice,
 {
+    fn init_error(self, error: Error<SPI::Error>) -> InitError<Self, SPI::Error> {
+        InitError {
+            driver: self,
+            error,
+        }
+    }
+
+    fn init_spi_error(self, error: SPI::Error) -> InitError<Self, SPI::Error> {
+        self.init_error(Error::Spi(error))
+    }
+
     pub async fn raw_write_register(&mut self, register: u8, value: u8) -> Result<(), SPI::Error> {
         let tx = [register, value];
         let mut ops = [AsyncOperation::Write(&tx)];
@@ -264,67 +275,38 @@ where
         DelayNs: AsyncDelayNs,
     {
         if let Err(e) = self.write_end_string().await {
-            return Err(InitError {
-                driver: self,
-                error: Error::Spi(e),
-            });
+            return Err(self.init_spi_error(e));
         }
 
         let osdm = match self.raw_read_register(registers::OSDM).await {
             Ok(v) => v,
-            Err(e) => {
-                return Err(InitError {
-                    driver: self,
-                    error: Error::Spi(e),
-                });
-            }
+            Err(e) => return Err(self.init_spi_error(e)),
         };
         if osdm != registers::OSDM_DEFAULT {
-            return Err(InitError {
-                driver: self,
-                error: Error::NotFound { osdm },
-            });
+            return Err(self.init_error(Error::NotFound { osdm }));
         }
 
         let device_type = match self.detect_device_type().await {
             Ok(v) => v,
-            Err(e) => {
-                return Err(InitError {
-                    driver: self,
-                    error: e,
-                });
-            }
+            Err(e) => return Err(self.init_error(e)),
         };
 
         if let Err(e) = self
             .raw_write_register(registers::VM0, registers::VM0_RESET)
             .await
         {
-            return Err(InitError {
-                driver: self,
-                error: Error::Spi(e),
-            });
+            return Err(self.init_spi_error(e));
         }
         delay.delay_us(config.reset_settle_delay_us).await;
         for _ in 0..config.reset_poll_max_tries {
             let vm0 = match self.raw_read_register(registers::VM0).await {
                 Ok(v) => v,
-                Err(e) => {
-                    return Err(InitError {
-                        driver: self,
-                        error: Error::Spi(e),
-                    });
-                }
+                Err(e) => return Err(self.init_spi_error(e)),
             };
             if (vm0 & registers::VM0_RESET) == 0 {
                 let state = match self.apply_config(device_type, config).await {
                     Ok(v) => v,
-                    Err(e) => {
-                        return Err(InitError {
-                            driver: self,
-                            error: e,
-                        });
-                    }
+                    Err(e) => return Err(self.init_error(e)),
                 };
                 return Ok(Max7456Async {
                     bus: self.bus,
@@ -332,10 +314,7 @@ where
                 });
             }
         }
-        Err(InitError {
-            driver: self,
-            error: Error::ResetTimeout,
-        })
+        Err(self.init_error(Error::ResetTimeout))
     }
 
     async fn apply_config(
@@ -346,35 +325,21 @@ where
         validate_config(config)?;
 
         let video_mode = resolve_video_mode_async(self, config.video_mode).await?;
-        let geometry = video_mode
-            .geometry()
-            .ok_or(Error::Config(ConfigError::unsupported(
-                ConfigField::VideoMode,
-            )))?;
-        let vm0 = vm0_value(config, video_mode);
-        let vm1 = vm1_value(config);
-        let dmm = dmm_value(config);
-        self.raw_write_register(registers::VM0, vm0).await?;
+        let state = runtime_state_from_config(device_type, config, video_mode)?;
+        self.raw_write_register(registers::VM0, state.vm0).await?;
         self.raw_write_register(registers::HOS, hos_from_offset(config.h_offset))
             .await?;
         self.raw_write_register(registers::VOS, vos_from_offset(config.v_offset))
             .await?;
 
-        self.raw_write_register(registers::VM1, vm1).await?;
-        self.raw_write_register(registers::DMM, dmm).await?;
+        self.raw_write_register(registers::VM1, state.vm1).await?;
+        self.raw_write_register(registers::DMM, state.dmm).await?;
 
         let rb = brightness_register(config.black_level, config.white_level)?;
         for register in registers::RB0..=registers::RB15 {
             self.raw_write_register(register, rb).await?;
         }
-        Ok(RuntimeState {
-            device_type,
-            video_mode,
-            geometry,
-            vm0,
-            vm1,
-            dmm,
-        })
+        Ok(state)
     }
 }
 
@@ -384,11 +349,7 @@ where
 {
     pub async fn set_invert(&mut self, invert: bool) -> Result<(), Error<SPI::Error>> {
         let mut state = self.state.runtime;
-        if invert {
-            state.dmm |= registers::DMM_INVERT_PIXEL_COLOR;
-        } else {
-            state.dmm &= !registers::DMM_INVERT_PIXEL_COLOR;
-        }
+        state.dmm = toggled_dmm(state.dmm, invert);
         self.raw_write_register(registers::DMM, state.dmm).await?;
         self.state.runtime = state;
         Ok(())
@@ -448,16 +409,7 @@ where
         y: u8,
         values: &[u8],
     ) -> Result<(), Error<SPI::Error>> {
-        let state = self.state.runtime;
-        let position = display_position(state.geometry, x, y)?;
-        let len = display_slice_len(values)?;
-        let row_end = (y as u16 + 1) * state.geometry.columns as u16;
-        if position.index() + len > row_end {
-            return Err(Error::OutOfBounds {
-                position: position.index(),
-                len: row_end,
-            });
-        }
+        let position = write_text_position(self.state.runtime.geometry, x, y, values)?;
         self.write_display_run_at(position, values).await
     }
 
@@ -490,20 +442,7 @@ where
     }
 
     fn check_display_range(&self, position: u16, len: u16) -> Result<(), Error<SPI::Error>> {
-        let geometry = self.state.runtime.geometry;
-        let Some(end) = position.checked_add(len) else {
-            return Err(Error::OutOfBounds {
-                position,
-                len: geometry.len,
-            });
-        };
-        if end > geometry.len {
-            return Err(Error::OutOfBounds {
-                position,
-                len: geometry.len,
-            });
-        }
-        Ok(())
+        check_display_range(self.state.runtime.geometry, position, len)
     }
 }
 
@@ -511,6 +450,17 @@ impl<SPI, State> Max7456Blocking<SPI, State>
 where
     SPI: BlockingSpiDevice,
 {
+    fn init_error(self, error: Error<SPI::Error>) -> InitError<Self, SPI::Error> {
+        InitError {
+            driver: self,
+            error,
+        }
+    }
+
+    fn init_spi_error(self, error: SPI::Error) -> InitError<Self, SPI::Error> {
+        self.init_error(Error::Spi(error))
+    }
+
     pub fn raw_write_register(&mut self, register: u8, value: u8) -> Result<(), SPI::Error> {
         let tx = [register, value];
         let mut ops = [BlockingOperation::Write(&tx)];
@@ -576,64 +526,35 @@ where
         DelayNs: BlockingDelayNs,
     {
         if let Err(e) = self.write_end_string() {
-            return Err(InitError {
-                driver: self,
-                error: Error::Spi(e),
-            });
+            return Err(self.init_spi_error(e));
         }
 
         let osdm = match self.raw_read_register(registers::OSDM) {
             Ok(v) => v,
-            Err(e) => {
-                return Err(InitError {
-                    driver: self,
-                    error: Error::Spi(e),
-                });
-            }
+            Err(e) => return Err(self.init_spi_error(e)),
         };
         if osdm != registers::OSDM_DEFAULT {
-            return Err(InitError {
-                driver: self,
-                error: Error::NotFound { osdm },
-            });
+            return Err(self.init_error(Error::NotFound { osdm }));
         }
 
         let device_type = match self.detect_device_type() {
             Ok(v) => v,
-            Err(e) => {
-                return Err(InitError {
-                    driver: self,
-                    error: e,
-                });
-            }
+            Err(e) => return Err(self.init_error(e)),
         };
 
         if let Err(e) = self.raw_write_register(registers::VM0, registers::VM0_RESET) {
-            return Err(InitError {
-                driver: self,
-                error: Error::Spi(e),
-            });
+            return Err(self.init_spi_error(e));
         }
         delay.delay_us(config.reset_settle_delay_us);
         for _ in 0..config.reset_poll_max_tries {
             let vm0 = match self.raw_read_register(registers::VM0) {
                 Ok(v) => v,
-                Err(e) => {
-                    return Err(InitError {
-                        driver: self,
-                        error: Error::Spi(e),
-                    });
-                }
+                Err(e) => return Err(self.init_spi_error(e)),
             };
             if (vm0 & registers::VM0_RESET) == 0 {
                 let state = match self.apply_config(device_type, config) {
                     Ok(v) => v,
-                    Err(e) => {
-                        return Err(InitError {
-                            driver: self,
-                            error: e,
-                        });
-                    }
+                    Err(e) => return Err(self.init_error(e)),
                 };
                 return Ok(Max7456Blocking {
                     bus: self.bus,
@@ -641,10 +562,7 @@ where
                 });
             }
         }
-        Err(InitError {
-            driver: self,
-            error: Error::ResetTimeout,
-        })
+        Err(self.init_error(Error::ResetTimeout))
     }
 
     fn apply_config(
@@ -655,33 +573,19 @@ where
         validate_config(config)?;
 
         let video_mode = resolve_video_mode_blocking(self, config.video_mode)?;
-        let geometry = video_mode
-            .geometry()
-            .ok_or(Error::Config(ConfigError::unsupported(
-                ConfigField::VideoMode,
-            )))?;
-        let vm0 = vm0_value(config, video_mode);
-        let vm1 = vm1_value(config);
-        let dmm = dmm_value(config);
-        self.raw_write_register(registers::VM0, vm0)?;
+        let state = runtime_state_from_config(device_type, config, video_mode)?;
+        self.raw_write_register(registers::VM0, state.vm0)?;
         self.raw_write_register(registers::HOS, hos_from_offset(config.h_offset))?;
         self.raw_write_register(registers::VOS, vos_from_offset(config.v_offset))?;
 
-        self.raw_write_register(registers::VM1, vm1)?;
-        self.raw_write_register(registers::DMM, dmm)?;
+        self.raw_write_register(registers::VM1, state.vm1)?;
+        self.raw_write_register(registers::DMM, state.dmm)?;
 
         let rb = brightness_register(config.black_level, config.white_level)?;
         for register in registers::RB0..=registers::RB15 {
             self.raw_write_register(register, rb)?;
         }
-        Ok(RuntimeState {
-            device_type,
-            video_mode,
-            geometry,
-            vm0,
-            vm1,
-            dmm,
-        })
+        Ok(state)
     }
 }
 
@@ -691,11 +595,7 @@ where
 {
     pub fn set_invert(&mut self, invert: bool) -> Result<(), Error<SPI::Error>> {
         let mut state = self.state.runtime;
-        if invert {
-            state.dmm |= registers::DMM_INVERT_PIXEL_COLOR;
-        } else {
-            state.dmm &= !registers::DMM_INVERT_PIXEL_COLOR;
-        }
+        state.dmm = toggled_dmm(state.dmm, invert);
         self.raw_write_register(registers::DMM, state.dmm)?;
         self.state.runtime = state;
         Ok(())
@@ -746,16 +646,7 @@ where
     }
 
     pub fn write_text(&mut self, x: u8, y: u8, values: &[u8]) -> Result<(), Error<SPI::Error>> {
-        let state = self.state.runtime;
-        let position = display_position(state.geometry, x, y)?;
-        let len = display_slice_len(values)?;
-        let row_end = (y as u16 + 1) * state.geometry.columns as u16;
-        if position.index() + len > row_end {
-            return Err(Error::OutOfBounds {
-                position: position.index(),
-                len: row_end,
-            });
-        }
+        let position = write_text_position(self.state.runtime.geometry, x, y, values)?;
         self.write_display_run_at(position, values)
     }
 
@@ -786,20 +677,7 @@ where
     }
 
     fn check_display_range(&self, position: u16, len: u16) -> Result<(), Error<SPI::Error>> {
-        let geometry = self.state.runtime.geometry;
-        let Some(end) = position.checked_add(len) else {
-            return Err(Error::OutOfBounds {
-                position,
-                len: geometry.len,
-            });
-        };
-        if end > geometry.len {
-            return Err(Error::OutOfBounds {
-                position,
-                len: geometry.len,
-            });
-        }
-        Ok(())
+        check_display_range(self.state.runtime.geometry, position, len)
     }
 }
 
@@ -877,6 +755,76 @@ fn dmm_value(config: Config) -> u8 {
     } else {
         0
     }
+}
+
+fn runtime_state_from_config<SpiError>(
+    device_type: DeviceType,
+    config: Config,
+    video_mode: VideoMode,
+) -> Result<RuntimeState, Error<SpiError>> {
+    let geometry = video_mode
+        .geometry()
+        .ok_or(Error::Config(ConfigError::unsupported(
+            ConfigField::VideoMode,
+        )))?;
+    Ok(RuntimeState {
+        device_type,
+        video_mode,
+        geometry,
+        vm0: vm0_value(config, video_mode),
+        vm1: vm1_value(config),
+        dmm: dmm_value(config),
+    })
+}
+
+fn toggled_dmm(dmm: u8, invert: bool) -> u8 {
+    if invert {
+        dmm | registers::DMM_INVERT_PIXEL_COLOR
+    } else {
+        dmm & !registers::DMM_INVERT_PIXEL_COLOR
+    }
+}
+
+fn row_end(geometry: ScreenGeometry, y: u8) -> u16 {
+    (y as u16 + 1) * geometry.columns as u16
+}
+
+fn write_text_position<SpiError>(
+    geometry: ScreenGeometry,
+    x: u8,
+    y: u8,
+    values: &[u8],
+) -> Result<DisplayPosition, Error<SpiError>> {
+    let position = display_position(geometry, x, y)?;
+    let len = display_slice_len(values)?;
+    let row_end = row_end(geometry, y);
+    if position.index() + len > row_end {
+        return Err(Error::OutOfBounds {
+            position: position.index(),
+            len: row_end,
+        });
+    }
+    Ok(position)
+}
+
+fn check_display_range<SpiError>(
+    geometry: ScreenGeometry,
+    position: u16,
+    len: u16,
+) -> Result<(), Error<SpiError>> {
+    let Some(end) = position.checked_add(len) else {
+        return Err(Error::OutOfBounds {
+            position,
+            len: geometry.len,
+        });
+    };
+    if end > geometry.len {
+        return Err(Error::OutOfBounds {
+            position,
+            len: geometry.len,
+        });
+    }
+    Ok(())
 }
 
 fn brightness_register<SpiError>(black: u8, white: u8) -> Result<u8, Error<SpiError>> {
