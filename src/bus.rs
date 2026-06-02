@@ -798,7 +798,13 @@ fn write_text_position<SpiError>(
     let position = display_position(geometry, x, y)?;
     let len = display_slice_len(values)?;
     let row_end = row_end(geometry, y);
-    if position.index() + len > row_end {
+    let Some(end) = position.index().checked_add(len) else {
+        return Err(Error::OutOfBounds {
+            position: position.index(),
+            len: row_end,
+        });
+    };
+    if end > row_end {
         return Err(Error::OutOfBounds {
             position: position.index(),
             len: row_end,
@@ -856,9 +862,9 @@ fn sanitize_display_byte(value: u8) -> u8 {
 }
 
 fn display_slice_len<SpiError>(values: &[u8]) -> Result<u16, Error<SpiError>> {
-    u16::try_from(values.len()).map_err(|_err| Error::OutOfBounds {
-        position: u16::MAX,
-        len: u16::MAX,
+    u16::try_from(values.len()).map_err(|_err| Error::InputTooLong {
+        len: values.len(),
+        max: u16::MAX,
     })
 }
 

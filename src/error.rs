@@ -47,6 +47,7 @@ pub enum Error<SpiError> {
     ResetTimeout,
     NvrBusyTimeout,
     OutOfBounds { position: u16, len: u16 },
+    InputTooLong { len: usize, max: u16 },
     InvalidCoordinate { x: u8, y: u8, columns: u8, rows: u8 },
     Config(ConfigError),
 }
