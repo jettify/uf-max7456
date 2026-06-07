@@ -1,0 +1,40 @@
+[package]
+name = "tbs_lucid_h7"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+embassy-executor = { version = "0.10.0", features = [
+  "platform-cortex-m",
+  "executor-thread",
+] }
+embassy-time = { version = "0.5.0", features = [
+  "defmt",
+  "defmt-timestamp-uptime",
+] }
+cortex-m = { version = "0.7.6", features = [
+  "inline-asm",
+  "critical-section-single-core",
+] }
+embedded-hal-bus = { version = "0.3.0", features = ["async"] }
+embedded-hal-async = "1.0.0"
+tbs-lucid-h7-bsp = { git = "https://github.com/jettify/uf-bsp", rev = "76c24f228a6ea3619e684d7b3f3e703e324507b2" }
+cortex-m-rt = "0.7.0"
+defmt = { version = "1.0.1", optional = true }
+defmt-rtt = { version = "1.1.0", optional = true }
+panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
+uf-max7456 = { path = "../.." }
+
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = 'fat'
+opt-level = 's'
+
+[features]
+defmt = ["dep:defmt"]
+defmt-rtt = ["dep:defmt-rtt"]
+panic-probe = ["dep:panic-probe"]
+default = ["debug"]
+debug = ["defmt", "defmt-rtt", "panic-probe", "embassy-executor/defmt"]
